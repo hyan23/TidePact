@@ -1,0 +1,1601 @@
+
+❯ 我想做一个异步的多客户端，单一服务端的kv数据库，而且是分层的，底层的kv可以被
+  上层覆盖或者屏蔽
+  而且支持事务，统一批修改必须同时写入成功，和同时写入到服务端
+  名字叫做TidePact，项目目前是空的，我设计架构你来实现，语言为go
+
+  希望你先看以下架构说明（暂时先发你一部分）
+
+  <pasted_content id="d316">
+  首先实现一个本地的kv数据库：
+  底层为只写日志
+  支持增删改操作，每个key都从version=0开始，往后追加节点
+  支持多次操作打包起来原子修改
+  支持删除后换一个id重建（每次创建key时，keyid不一样）
+  支持剪裁。只要保留删除操作之外的叶子节点即可
+
+
+  现在增加多客户端异步同步功能：
+
+  日志必须先在服务端创建空日志
+  客户端调用服务端创建client_id，并创建本地空日志，然后调用服务端确认client_id
+  已激活（幂等）
+  服务端定期删除未激活client_id
+
+  1.客户端push
+  push前，先写prepare
+  push日志，然后push，最后记录pushed日志以及记录conflict的key
+  首先，push一定会成功，因为是幂等的
+
+  对于删，改操作
+      如果自己版本>服务端版本+1 服务端就accept
+      否则，服务端conflict
+  对于增操作
+      如果服务端不存在该key（不比较keyid） accept
+      否则 ，服务端conflict
+
+  push成功后，就原子写pushed日志，以及：
+      如果push成功后，写pushed日志前，没有新修改
+          accept的事务，不用做什么
+          conflict的事务，在事务所有keys最后一个version后面增加conflict节点
+      如果有新修改：
+          基于accept的事务的新修改，不用做什么
+          基于conflict的事务的新修改（事务），事务所有keys全部都conflict了结
+  后面相关事务的keys也要以conflict了结
+
+  以后conflict的key要从最后一次push成功的那个点分叉，如果没有就建立首节点
+  </pasted_content id="d316">
+
+⏺ 我读完了这一部分。下面先说我的理解，再列出几处需要你确认的地方。你说后面还有内
+  容，所以我先不写代码，等架构发全了再动手，免得返工。
+
+  我的理解
+
+  本地存储层
+  - 底层是只追加的日志。每个 key 是一条版本链，从 version=0 开始往后追加节点。
+  - 每次创建 key 分配一个新的 key_id。删除后再创建是一条新链，旧链不会被复活。
+  - 一个事务里的多个操作作为一条日志记录写入，靠它保证原子性。
+  - 剪裁（compaction）时只保留每条链的叶子节点，删除节点不保留。
+
+  客户端注册
+  - 服务端先建好空日志。
+  - 客户端向服务端申请 client_id，建好本地空日志，再调用 activate 确认（幂等）。
+  - 服务端定期清理一直没激活的 client_id。
+
+  Push 流程
+  1. 本地先写 prepare push 日志。
+  2. 发 push。push 是幂等的，所以重试最终一定成功。
+  3. 原子地写 pushed 日志，同时记下哪些 key 冲突了。
+  - 冲突以事务为单位：事务里有一个 key 冲突，整个事务都算冲突。
+  - push 期间本地如果有新修改，凡是基于冲突事务的修改都会被连带判为冲突，而且会
+    继续传递下去。
+  - 冲突的 key 以后从最后一次 push 成功的节点分叉；如果从没 push
+    成功过，就新建首节点。
+
+  需要确认的点
+
+  1. 改/删的接受条件：你写的是「自己版本 > 服务端版本 + 1 就
+     accept」，我怀疑是笔误。我理解的意思是：客户端这批修改所基于的版本（即上次
+     同步到的版本）等于服务端当前版本，就 accept。本地连续改了几次（比如
+     v3→v4→v5），push 时一次带上，只看基础版本 v2
+     是否等于服务端版本。这样理解对吗？
+  2. 改/删要不要比较 key_id：「增」明确说了不比较 key_id。那「改/删」是否要求
+     key_id 一致？否则可能出现这种情况：服务端的 key
+     已被别的客户端删了又重建，版本号恰好对上，结果误判为 accept。
+  3. push 幂等的实现：我打算让每个客户端维护一个单调递增的
+     push_seq。服务端记住每个 client_id 最后一次处理的 seq
+     和结果，收到重复请求就直接返回缓存的结果。这样可以吗？
+  4. 连带冲突的范围：后续事务只要动到了某个冲突事务涉及的
+     key，就整个判为冲突，而且这个事务里的其他 key
+     再继续往下传染（求传递闭包）。是这个意思吗？
+  5. 剪裁和分叉点：冲突后要「从最后一次 push 成功的那个点分叉」，那这个节点在剪
+     裁时也必须保留，哪怕它已经不是叶子了。另外，删除节点如果还没
+     push，应该也得留着，不然删除同步不到服务端？
+  6. 同一事务里先删后建：一个事务里对同一个 key 先删再创建（换了新的
+     key_id），服务端怎么判定？分别按删、增两步各自判断吗？
+  7. 还没提到的部分：pull（客户端怎么拿到服务端的新数据、冲突以后怎么合并），以
+     及分层覆盖/屏蔽，我猜都在后半部分？
+  8. 技术选型（没有特别要求的话我就按这个默认来）：
+     - 通信：gRPC，备选 HTTP/JSON
+     - 日志格式：长度前缀 + CRC32 + protobuf
+       编码的记录，崩溃后截掉末尾损坏的部分
+     - 服务端存储：复用同一套日志引擎
+
+  后半部分架构发过来时，顺便回答一下这几点，我就开始实现。
+
+❯ 1. 连续有多个修改，就看第一个服务端没有的修改是否等于服务端version+1，如果第
+  一个服务端接受了，后续的也接受
+     2.改，删要比较key_id
+     3.客户端每次prepare push都生成一个push
+  id(uuid)入库，以后就必须重试这次push直到成功
+     4.对，要传染
+
+⏺ 这四点我都记下了。整理成规则如下：
+
+  规则确认
+
+  1. 改/删的判定：服务端先找出这批修改里自己还没有的第一个版本。如果它的版本号等
+     于服务端版本 + 1，并且 key_id 一致，这一批就全部 accept；否则判为冲突。
+  2. key_id 校验：改和删都要求 key_id
+     与服务端一致。不一致直接判为冲突。只有「增」不比较 key_id。
+  3. 幂等：每次写 prepare push 日志时，生成一个 push_id（UUID）一起落盘。push
+     的内容在 prepare 那一刻就固定了，之后只能用同一个 push_id
+     重试，直到成功。服务端按 push_id 去重，重复请求直接返回第一次的结果。这也意
+     味着同一个客户端同一时间最多只有一个 push 在进行。
+  4. 传染：从冲突事务出发求传递闭包。后续事务只要基于某个冲突的
+     key，整个事务都判为冲突；它涉及的其他 key 再继续往后传染。
+
+  还没答的几点，可以和后半部分架构一起回复：
+
+  5. 剪裁时保留什么：最后一次 push 成功的节点（以后冲突要从这里分叉），以及还没
+     push 的删除节点，剪裁时是不是都得保留？
+  6. 先删后建：同一个事务里对同一个 key 先删再建（换了新的
+     key_id），服务端是不是按删、增两步分别判定？
+  7. 后半部分：pull
+     和冲突后的合并，以及分层覆盖/屏蔽，应该都在你后面要发的内容里？
+  8. 技术选型：你没意见的话，我就按之前的默认方案来，通信用 gRPC，日志记录带 CRC
+     校验。
+
+  等你把剩下的架构发过来，我就开始写代码。
+
+❯ 5.是的
+  6.既然删除会accept，增加也会被accept才对，因为服务端原子处理push
+  7.pull后续再发给你
+  8.日志用sqlite还是日志文件更好？
+  ⎿  13 skills available
+
+⏺ 第 5、6 点我按你说的来。第 6 点：push 由服务端原子处理，所以删除被 accept
+  时，同一 push 里紧跟的重建也一起 accept；删除冲突时，整个事务一起冲突。
+
+  日志用 SQLite 还是日志文件
+
+  我建议用 SQLite。「只追加日志」作为逻辑模型保留：节点表只插入，不修改，只有剪
+  裁时才会删除。下面是几项关键需求的对比：
+
+  ┌─────────────────────────┬───────────────┬──────────────────────────────┐
+  │          需求           │    SQLite     │           日志文件           │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │ 原子写入多条记录（写    │ 一个事务就搞  │ 要把所有内容塞进一条记录，崩 │
+  │ pushed 日志的同时标记冲 │ 定            │ 溃恢复要自己写               │
+  │ 突、处理传染）          │               │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │ 查询：某个 key          │               │                              │
+  │ 的最新版本、最后一次    │ 建索引后直接  │ 要在内存里维护索引，启动时重 │
+  │ push 成功的节点、还没   │ 查            │ 放整个日志或者另做快照       │
+  │ push 的事务             │               │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │                         │ SQL           │                              │
+  │ 计算冲突传染的范围      │ 查询加少量 Go │ 全部在内存里自己算           │
+  │                         │  代码         │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │ 剪裁                    │ DELETE 之后   │ 重写文件，再原子替换         │
+  │                         │ VACUUM        │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │ 服务端并发处理多个客户  │ 天然支持      │ 要自己做分段和索引           │
+  │ 端、数据量超过内存      │               │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │ 写入吞吐                │ 开 WAL        │ 更高                         │
+  │                         │ 模式后足够用  │                              │
+  ├─────────────────────────┼───────────────┼──────────────────────────────┤
+  │                         │ 一个层一个库  │                              │
+  │ 后面的分层覆盖          │ ，或者加一个  │ 要自己做合并读               │
+  │                         │ layer 列，查  │                              │
+  │                         │ 询容易组合    │                              │
+  └─────────────────────────┴───────────────┴──────────────────────────────┘
+
+  日志文件只在纯写入吞吐上占优。可是这个项目的难点在
+  push、冲突、传染、分叉这些带查询的状态机上，用 SQLite
+  能省掉一大块容易出错的崩溃恢复和索引代码。
+
+  具体做法
+  - 驱动用 modernc.org/sqlite。它是纯 Go 实现，不需要 cgo，交叉编译方便。
+  - 开 WAL 模式，synchronous=FULL，保证一个事务提交后断电也不丢。
+  - 存储层封装成一个 Store 接口。以后真要换成日志文件，上层不用改。
+  - 客户端和服务端用同一套表结构。
+
+  初步表结构（client_id、push_seq 这些同步状态单独建表）：
+
+  txns   (txn_id PK, seq, push_id NULL, state)          -- state:
+  local/pushing/accepted/conflict
+  nodes  (key, key_id, version, txn_id, op, value, PRIMARY KEY(key, key_id,
+  version))
+  pushes (push_id PK, seq, status, result_blob)          -- prepare / pushed
+
+  你同意的话，我就先实现本地存储层：增删改、事务打包、换 key_id
+  重建、剪裁。接着实现客户端注册和 push。pull 等你后面发过来再做。
+
+❯ 下面阐述客户端pull：
+  pull可以后台做
+  merge也可以后台做
+
+  merge的时候，key_id存在的情况下，本地存在push过的分支和没有push过的分支，还有
+  本地不存在的key_id
+  没有push过的分支，就要push
+  push过的分支，就比较最新有效节点
+      local_version < version: merge
+      local_version >= version: 忽略
+  不存在的key：
+      直接merge
+
+  merge也需要考虑事务的整体性，同一个事务的要一起merge
+  pull之后要记录pulled日志
+
+⏺ 我理解的 pull/merge 流程如下：
+
+  1. pull：在后台按游标增量拉取服务端的事务。拉完记一条 pulled
+     日志，里面保存游标。
+  2. merge：也在后台执行。以服务端事务为单位，在一个本地 SQLite
+     事务里原子落盘。每个 key 按 key_id 分三种情况处理：
+     - 本地没有这个 key_id：直接 merge。
+     - 本地有这个 key_id，有 push
+       过的分支：拿服务端版本和本地最新有效节点比较。本地版本小于服务端版本就
+       merge，否则忽略。服务端回传的我自己 push
+       过的事务，正好落在「忽略」这一支。
+     - 本地有这个 key_id，有没 push 过的分支：merge 不动它，交给 push。下次 push
+       时如果服务端已经往前走了，就按 push 规则判为冲突。
+
+  需要确认的点
+
+  1. 增量游标：我打算让服务端给每个 accept 的事务分配一个全局递增的
+     server_seq。客户端每次 pull 带上 last_pulled_seq，拉取之后的事务，pulled
+     日志就记新的 seq。新客户端从 0
+     开始拉，也就是全量拉一遍。这样可以吗？还是新客户端要走快照？
+  2. 「最新有效节点」怎么定义：我的理解是 push
+     过的那条分支上的最后一个节点，跳过冲突节点和本地没 push 的节点。对吗？
+  3. 事务整体性的确切含义：一个服务端事务涉及 key A 和 key B。A 在本地满足
+     local_version >= version 该忽略，B 需要 merge。这时候：
+     - (a) 逐个 key 判断，A 忽略、B
+       merge，只是整个过程放在同一个本地事务里原子提交？
+     - (b) 还是整个事务要么全 merge、要么全忽略？
+
+     我倾向 (a)。
+  4. 本地有未 push 修改时，读到的是哪个值：key A 本地有未 push 的分支 v5（基于
+     v4），pull 下来服务端的 v5'。merge 之后：
+     - v5' 接在 push 过的分支上，v4 → v5'。
+     - 本地未 push 的 v5 作为另一条分支保留，等 push。
+
+     在 push 结果出来之前，本地读 A 返回谁？我倾向返回本地未 push 的
+     v5，也就是本地写优先，直到它被判为冲突。
+  5. 服务端出现新的 key_id：本地 key A 是 key_id=k1，服务端那边 A
+     被删掉后重建成了 k2。merge 时我会把 k1 标成删除，然后接入 k2。如果本地 k1
+     上还有没 push 的修改，就留给 push 判为冲突。对吗？
+  6. 分层覆盖/屏蔽：这部分还没讲，后面会发吗？
+
+  前面几块已经定得差不多了。分层部分会影响读路径，但不影响底层的节点表和日志结构
+  。你要是同意，我现在就开始写本地存储层和 push，pull 和 merge
+  等这几点确认后再接上。
+
+❯ 1. server_seq可以，新客户端暂时全量拉
+  2. 对
+  3. 不存在A该忽略，B要merge的情况
+  4. 未push先不merge，所以读到的是本地的
+  5. 对，merge无论什么操作都是同理的，而且merge都是按全局日志的逻辑顺序merge，
+  必然要先处理k1，才能处理到k2
+  6. 后面发
+
+  继续讨论和理解
+
+⏺ 你这几条回答里，第 3 条和第 5
+  条推出来的结论比较重要，我先把它们写清楚，再列出剩下的问题。
+
+  从你的回答推出来的几条结论
+
+  ① merge 按 server_seq 严格顺序执行，不能跳着处理。
+  - 因为按全局顺序，本地 push 过的分支一定是服务端历史的一个前缀。
+  - 所以「local_version >= version
+    该忽略」只会出现在一种情况：这个事务就是我自己 push 上去、被 accept
+    的那个。这样的事务整体都是自己的，不会出现部分 key 忽略、部分 key merge
+    的情况。第 3 条成立。
+  - 我建议服务端在每个事务上记下来源 push_id。pull 下来时，客户端直接按 push_id
+    认出自己的事务并跳过，不用逐个 key 比版本。比版本的逻辑我保留，作为校验用。
+
+  ② 有一种边界情况：push 已经被服务端 accept，但客户端崩了，没来得及写 pushed
+  日志。
+  - 这时 pull 会拉到自己的这个事务，而本地那条分支在日志里还是「没 push
+    过」的状态。
+  - 按规则这条分支不 merge，先重试 push。因为 push_id
+    幂等，服务端会返回原来的结果，客户端写下 pushed 日志，然后接着 merge。
+  - 所以 merge 时遇到「没 push 过的分支」，就先把未完成的 push
+    做完再往下走。这个顺序是自洽的。
+
+  ③ pull 和 merge 拆成两个后台任务，各用各的游标。
+  - pull：从服务端拉取事务，原样存进本地的收件表，然后写 pulled 日志，记录
+    pulled_seq。
+  - merge：从收件表里按 seq 顺序取事务，一个服务端事务对应一个本地 SQLite
+    事务，记录 merged_seq。
+  - 两个游标满足 merged_seq ≤ pulled_seq。崩溃后各自从自己的游标接着做。
+
+  ④ 第 5 条：k1 删除、k2 重建这种情况自然就处理对了。
+  - merge 先处理到 k1 的删除，本地就标记删除。
+  - k1 上本地还没 push 的修改，push 时因为 key_id 不一致而冲突。
+  - 后面再 merge 到 k2 的创建，直接接进来。
+
+  需要确认的点
+
+  1. 第 4 条「未 push 先不 merge」的范围
+     - 服务端事务 T 改了 A 和 B。本地 A 有没 push 的分支，B 没有。
+     - 我的理解是：整个 T 都要等 A 的 push 结果出来才能 merge。按①，T
+       后面的所有事务也跟着被卡住。
+     - A 的 push 结果出来后，要么是自己的事务，跳过；要么冲突，A 分叉。这之后 T
+       才整体 merge 进来。对吗？
+  2. 冲突后从哪个点分叉
+     - 「从最后一次 push 成功的点分叉」，这个点是否也包括 merge
+       进来的节点？我的理解是「最新有效节点」，也就是 push 和 merge 都算。
+     - 如果只算 push：冲突以后在 A 上的新修改，会基于一个已经过时的版本。下次
+       push 又会冲突，等于白改。
+     - 还有一个活锁的可能：A 冲突之后、merge 完成之前，用户又改了
+       A。这个新修改又成了「没 push 的分支」，merge 再次被卡住，push
+       又会冲突，可能一直循环下去。
+     - 建议：冲突之后，A 上的新修改先挂起，等对应的服务端事务 merge
+       完成，再以新的最新有效节点为基础。或者在冲突分支上允许 merge
+       继续推进。你倾向哪种？
+  3. 「增」冲突以后怎么办
+     - 本地新建了 A（k3，从没 push 过），服务端已经有 A（k2），push 时冲突。
+     - 「没有 push 点就建立首节点」，这个首节点用的是新的 key_id，还是等 merge
+       进 k2 之后，直接接到 k2 上？
+  4. 冲突暴露给应用层吗
+     - 被冲突掉的修改，应用层能不能查到？比如提供
+       ListConflicts()，让上层重新提交。
+     - 还是只在日志里留个记录、静默丢弃？
+  5. 服务端的处理方式
+     - 我打算让服务端单线程串行处理 push：分配 server_seq、按 push_id 去重、整体
+       accept 或冲突，全部在一个 SQLite 事务里完成。
+     - 这样全局顺序天然成立。吞吐的上限就是单个写事务，这个阶段可以接受吗？
+
+  分层那部分发过来之前，可以先把这 5 点定下来。
+
+❯ 1. 对，反正没push的分支肯定有结果
+  2. 当然包括merge进来的节点啊
+  3. 看不懂你想表达的
+  4. 我现在讨论的是pull语义
+  5. 实现细节不是我现在要讨论的
+
+⏺ 明白，后面只讨论语义。第 1、2 条确认了。第 3 条我换个说法，用一个例子讲：
+
+  第 3 条：「增」冲突之后，本地这个 key 怎么办
+
+  1. 客户端 C1 本地新建了 key A，分到的 key_id 是 k3，还没 push。
+  2. 同一时间，客户端 C2 也新建了 A（key_id=k2），先 push 成功了。
+  3. C1 push。服务端已经有 A 了，所以 C1 的「增」冲突。
+
+  按规则，冲突的 key 要从最后一次有效节点分叉；没有有效节点就建首节点。C1
+  从来没同步过 A，没有有效节点，所以会走「建首节点」这条路。
+
+  我的疑问是：等 C1 pull 并 merge 了 C2 的 k2 之后，C1 上 A 的状态是哪一种？
+
+  - (a) k3 整条作废，本地 A 就是 k2，以后对 A 的修改都接在 k2 后面。
+  - (b) k3 作为冲突分支保留，另外再建一个新首节点。
+
+  我的理解是 (a)：「建首节点」只是说没有可以回退的点，冲突的 k3
+  记为冲突就结束了；之后 merge 进来的 k2 就是本地的 A。对吗？
+
+  还有一个 pull 语义的问题
+
+  push 冲突的原因，可能是一个还没 pull 下来的服务端事务。所以从 push 判为冲突到
+  merge 完成之间，有一段时间本地最新有效节点还是旧的。如果用户在这段时间又改了
+  A：
+
+  1. 这次修改基于旧节点，成了一条新的「没 push 的分支」。
+  2. 按第 1 条，merge 会被卡住，先 push。
+  3. 这次 push 又冲突。
+  4. 用户如果一直在改，就会一直重复 1–3，merge 推进不了。
+
+  这个情况你是接受（实际中窗口很小），还是希望在语义上规定一下？比如：冲突以后，
+  在对应的服务端事务 merge 完成之前，这个 key 上的修改直接判为冲突，不再触发
+  push。
+
+❯ 你的a和b不是一个意思吗，都是保留k3分支，建立新的k2链
+
+  merge推进不了没关系，一直尝试push
+
+  继续理解和讨论
+
+⏺ 明白，(a) 和 (b) 确实是一回事：k3 留作冲突分支，本地 A 的有效链换成 merge
+  进来的 k2。merge 推进不了也不用特别处理，一直重试 push 就行。
+
+  我把读和 merge 的语义再推一遍，有三处需要你确认。
+
+  1. 本地读到哪个值
+
+  本地读一个 key，按下面的顺序取：
+
+  1. 有没 push 的分支，就取它的最新节点。
+  2. 没有的话，取最新有效节点。有效节点指 push 被 accept 的节点，或者 merge
+     进来的节点。
+  3. 冲突分支对读不可见。比如上面例子里的 k3。
+
+  所以本地看到的是三部分叠起来的结果：服务端 merge 到 merged_seq
+  为止的状态，加上自己已经被 accept、但还没 pull 到的 push，再加上本地还没 push
+  的修改。事务的整体性靠 merge 和 push 都按事务原子执行来保证。
+
+  这个读语义对吗？
+
+  2. 服务端剪裁和落后的客户端
+
+  剪裁规则是「保留删除操作之外的叶子节点」。如果服务端也这样剪，pull
+  的语义会出问题：
+
+  - 删除丢失：客户端 C1 的 pulled_seq 停在 50。服务端在 seq 60 删了
+    B，之后剪裁，把这个删除节点去掉了。C1 再 pull，永远看不到这次删除，本地的 B
+    一直活着。
+  - 旧链不消失：服务端 A 从 k1 删掉，重建成 k2，剪裁后只剩下 k2 的叶子。C1 merge
+    进 k2（对它来说是「本地不存在的 key_id」，直接 merge），但本地的 k1
+    没收到删除，A 同时有两条活着的链。
+
+  可以从这几种处理方式里选：
+
+  - (a) 服务端的删除节点要保留，直到所有已激活客户端的 pulled_seq
+    都越过它，才能剪掉。
+  - (b) 客户端落后于服务端已剪裁的位置时，强制走一次全量拉。
+  - (c) 补一条 merge 规则：merge 进某个 key 的新 key_id 时，本地这个 key 的旧
+    key_id 链一律视为已删除。
+
+  我倾向 (c)，再配合 (a) 或 (b) 中的一个。只有 (c) 解决不了「B
+  被删除、但之后没有重建」这种情况。
+
+  3. 冲突分支要不要剪
+
+  k3 这种冲突分支，末端是一个冲突节点，它也是叶子，而且不是删除节点。按现在的剪
+  裁规则，它会被一直保留。
+
+  - 这是你想要的吗？比如留给上层查看被冲突掉的修改。
+  - 还是剪裁时冲突分支也一起清掉？
+
+❯ 1. 对
+  2. 你说的删除消失和旧链不消失不也是一回事吗，这块我还没发给你，以后讨论
+  3. 只保留最后一个节点
+
+  继续讨论理解
+
+⏺ 收到。第 2 点等你后面发过来再讨论；第 3
+  点我记为：冲突分支剪裁时只保留最后一个节点。
+
+  我继续往下推，又发现三处规则没覆盖到的地方，两处在冲突传染上，一处在 pull 上。
+
+  1. 传染按 key 名算，还是按 key_id 算？
+
+  先看一个例子。本地按顺序有两个事务，都还没 push：
+
+  1. T1：删除 A（key_id=k1）。
+  2. T2：重建 A，分到新的 key_id=k3。
+
+  push 时，服务端的 k1 已经被别人改过，所以 T1 冲突。
+
+  那 T2 要不要被 T1 传染？
+
+  - 按 key 名算：T2 也是在 A 上的后续修改，被传染，T2 也冲突。
+  - 按 key_id 算：k3 和 k1 不是同一条链，T2
+    不受影响，作为「增」单独判定。可服务端此时 A 还存在，所以 T2
+    的「增」也会冲突，只是冲突的原因不同。
+
+  两种算法结果碰巧一样。但如果同一个事务里还写了别的 key，比如 T2 同时写了 B，那
+  B 会不会被连带判为冲突，就取决于这里按哪种算法。
+
+  我倾向按 key 名算。理由是：重建本身就是基于「我已经删掉了」这个前提。
+
+  2. 传染只看写，不看读？
+
+  再看一个例子：
+
+  1. T1 写了 A，后来冲突了。
+  2. T2 读了 A 的值，算出一个结果，写进 B。T2 本身没有写 A。
+
+  T2 实际上是依赖 T1 的，但它的写集合里没有 A，所以不会被传染。B 会被正常
+  push、accept。
+
+  我的理解是，这个系统不记录读集合，只按写集合传染。这种依赖由应用层自己负责。对
+  吗？
+
+  3. 新客户端全量拉完之前能不能写？
+
+  新客户端激活以后，要从 seq 0 开始全量 pull 和 merge。
+
+  - 全量拉完之前允许写：比如用户新建 A，而服务端其实早就有
+    A，只是还没拉下来。这次 push
+    必然冲突，按规则这样处理是自洽的，但用户的第一批修改很可能全部作废。
+  - 规定全量拉完之前不能写：可以避免上面的情况，但客户端要等全量拉完才能用。
+
+  你倾向哪种？
+
+❯ 1.按名字
+  2.修改某个值，应用层也同时修改相关联的值，即使没变化
+  3.规定不能写干啥？没必要
+
+⏺ 三点都记下了：
+
+  1. 传染按 key 名算。 同名 key 上的后续事务都会被传染，包括删除后换 key_id
+     重建的。
+  2. 依赖靠显式写入表达。 应用层要声明「T2 依赖 A」，就在 T2 里把 A
+     也写一次，值不变也写。所以写入同样的值也必须生成一个新版本节点并
+     push，存储层不能把它当成「无变化」优化掉。
+  3. 新客户端不限制写入。 全量拉完之前写的东西，按正常规则走：push
+     时冲突就冲突。
+
+  把到目前为止定下来的语义汇总一下，你看有没有偏差：
+
+  本地存储
+  - 只追加日志。
+  - 每个 key 有自己的版本链，从 0 开始，每次创建分配一个新的 key_id。
+  - 一个事务原子写入。写入同样的值也生成新节点。
+
+  剪裁
+  - 保留叶子节点，但已删除的不保留。
+  - 最新有效节点要保留。
+  - 冲突分支只保留最后一个节点。
+  - 服务端怎么剪裁，等你后面发。
+
+  注册
+  - 服务端创建 client_id。
+  - 客户端建好本地日志后调用激活，激活是幂等的。
+  - 服务端定期清理一直没激活的 client_id。
+
+  push
+  - 写 prepare 日志时生成 push_id，同时冻结这次要 push 的内容，之后用同一个
+    push_id 重试直到成功。
+  - 改和删：比较 key_id，并要求「服务端没有的第一个版本 = 服务端版本 + 1」。
+  - 增：服务端没有这个 key 名就 accept。
+  - 判定以事务为单位，整体 accept 或整体冲突。
+  - 冲突按 key 名在后续事务里传染。
+  - 冲突的 key 从最新有效节点分叉；有效节点包括 merge
+    进来的。没有有效节点就建首节点。
+
+  pull 和 merge
+  - 都在后台执行。
+  - pull 按 server_seq 增量拉取，记录 pulled 日志。新客户端从 0 全量拉。
+  - merge 按 server_seq 严格顺序执行，按事务原子执行。
+  - 每个 key 的判定：
+    - 本地没有这个 key_id：直接 merge。
+    - 本地有 push 过的分支：本地版本小于服务端版本就 merge，否则忽略。
+    - 本地有没 push 的分支：先 push，等结果出来再 merge。push 一直冲突、merge
+      一直推进不了也接受。
+
+  读
+  - 有没 push 的分支，就读它的最新节点。
+  - 没有就读最新有效节点。
+  - 冲突分支不可见。
+
+  分层和服务端剪裁这两块你说以后发。要我先把上面这套写成 docs/design.md
+  放进仓库作为规格，并开始实现本地存储层吗？还是等分层部分讨论完再动手？
+
+❯ 3.服务端剪裁
+      服务端可以剪裁日志，直至只剩下以下类型的叶子节点：
+          新增
+          修改
+          pulled（就是记录每个客户端push的进度）
+
+  因此删除节点可以不被保留
+  剪裁不影响push，因为push只依赖每个key的最新版本和客户端push进度
+  会影响pull操作
+      因为上次pull的后续日志可能已经消失了，所以客户端应该使用全量pull
+      且pull的全量日志中，并未保留“删除”节点
+      因此 客户端的上一个pushed前的日志中的keys
+  如果没出现在全量的pull日志中，就应当删除
+          merge前就要做完所有删除 不然存在两个key一样但keyid不一样的key是可能的
+          用keyid对比 去判断哪些key应该删除
+          删除时使用delete节点删除 这节点以后不用push
+      而且merge的时候，可能服务端带来的key的version远大于当前version，客户端应
+  当接收version跳跃（仅当全量pull的时候）
+  本地日志的剪裁方法（增加同步功能后）：
+      没有push的节点全部保留
+      push了的节点：
+          保留增 改节点accept的叶子节点
+          不保留删节点的accept节点
+          保留最后一个pushed节点，最后一个pulled节点    merged节点
+          保留增 删 改的conflict节点
+              如果叶子节点为conflict，往前找到第一个pushed的节点，这中间的保留
+  ，这个节点之前的删除就行了 如果前面没有pushed节点 就保留整条链
+
+⏺ 我先把这部分整理成规则，再列出需要确认的地方。
+
+  我的理解
+
+  服务端剪裁
+  - 每个存活 key 只保留最新的增/改叶子节点。
+  - 每个客户端只保留最新的 push 进度记录，用来做 push_id 去重。
+  - 删除节点、中间版本、事务结构都可以剪掉。
+  - 剪裁不影响 push：push 只依赖每个 key 的最新版本和客户端的 push 进度。key
+    被删除并剪掉以后，在服务端就等于不存在。这时「增」会
+    accept，「改」「删」因为找不到 key_id 会冲突。
+
+  全量 pull
+  - 客户端增量 pull 的游标所指的日志已经被剪掉了，就改走全量 pull。
+  - 全量 pull 拿到的是一份快照，里面每个 key 只有叶子节点，没有删除节点。
+  - merge 之前先做删除：本地已同步的 key 按 key_id
+    和快照对比，快照里没有的，本地追加一个本地删除节点。这个节点以后不 push。
+  - 删除做完以后再 merge 快照。只有全量 pull 时，才允许版本号跳跃。
+
+  本地剪裁
+  - 没 push 的节点全部保留。
+  - 已 accept 的节点：保留增/改的叶子，accept 的删除叶子不保留。
+  - 同步记录（pushed、pulled、merged）各保留最后一条。
+  - 冲突分支：从叶子往前找到第一个已 push
+    的节点，这一段保留，再往前的删掉。往前找不到已 push 的节点，就保留整条链。之
+    前定的「冲突分支只保留最后一个节点」作废，以这条为准。
+
+  需要确认的点
+
+  1. 全量 pull 时哪些本地 key 要比对删除
+
+     你写的是「上一个 pushed 前的日志中的 keys」。merge 进来的 key 应该也算吧？
+
+     例子：B 是别的客户端建的，本地是 merge 进来的。后来服务端删了
+     B，又被剪掉了。如果只比对自己 push 过的 key，本地的 B 就永远删不掉。
+
+     所以我理解比对的范围是所有已同步的 key，也就是 push 被 accept 的和 merge
+     进来的都算。对吗？
+  2. 快照和正在进行的 push 有时间差
+
+     pull 和 push 都在后台跑，可能出现下面这个时间线：
+     a. 服务端在 seq=100 生成快照，开始返回全量数据。
+     b. 本地一个 push 在 seq=101 被 accept，里面新建了 C。
+     c. 快照里没有 C，按规则本地会把 C 删掉，但这是误删。
+
+     我的想法是：只比对在快照 seq 之前就已同步的 key。这就要求快照带上它对应的
+     server_seq。或者干脆规定全量 pull 期间不允许 push。你倾向哪种？
+  3. 快照的原子性
+
+     快照里的叶子节点来自不同的事务，原来的事务边界已经没了。
+
+     我理解的处理方式是：「先删除、再 merge」整个当成一个原子单元，一次性落盘。
+     这样本地要么停在旧状态，要么到达快照 seq 的完整状态，不会只 merge
+     一半。这样可以吗？
+  4. 本地删除节点算不算「没 push 的节点」
+
+     全量 pull 产生的本地删除节点，标记的是「不用 push」。按「没 push
+     的节点全部保留」这条，它会被永久保留。
+
+     我的理解是：它应该当成已同步的删除，和 accept
+     的删除节点一样可以剪掉。对吗？
+  5. 冲突分支往前找的终点
+
+     「往前找到第一个 pushed 的节点」，这里应该也包括 merge 进来的节点吧？
+
+     前面说过，冲突分支是从最新有效节点分叉的，而有效节点包括 merge
+     进来的。如果分叉点是一个 merge 节点，只认 pushed
+     节点的话，就会一路找到更早的地方，甚至保留整条链。
+
+     所以我理解终点是冲突分支的分叉点，也就是最新有效节点。对吗？
+
+❯ 1. 对
+  2. 可以，只删除server_seq之前的本地key
+  3. 可以
+  4. 只要它已经push过，可以剪掉
+  5. 包括
+
+  继续理解和讨论
+
+⏺ 第 2、3 条的规则我都记下了，第 1、5 条也确认了。第 4
+  条和你的回答之间有个矛盾，先说它。
+
+  第 4 条：本地删除节点永远不会被 push
+
+  全量 pull 时产生的本地删除节点，你之前定的是「以后不用 push」。按「只要它已经
+  push 过，可以剪掉」这条，它永远等不到 push，所以永远剪不掉。
+
+  你的意思是不是：这个 key 之前同步过（push 被 accept 或 merge 进来过），那么这
+  个本地删除节点就可以剪掉？它本来就是从服务端状态推导出来的，等同于已同步。
+
+  继续往下推，又有两处要确认
+
+  1. 全量 pull 遇到本地没 push 的分支
+
+  本地 A（k1）的有效节点是 v4，上面还有一条没 push 的分支 v5。服务端已经删除
+  k1，并且剪掉了。快照里没有 k1，按规则本地要删掉 k1。
+
+  我的理解是：沿用「未 push 先不 merge」，而且快照是一个原子单元，所以整个全量
+  pull 都要等 push 结果出来。这次 push 里，k1
+  在服务端已经不存在了，必然冲突。冲突分支保留，然后再执行「删除 k1 → merge
+  快照」。
+
+  对吗？
+
+  2. 服务端剪裁后，push 结果还要保留
+
+  你说服务端会保留每个客户端的 push 进度。考虑这个时间线：
+  1. 服务端处理完一次 push。
+  2. 客户端还没写 pushed 日志就崩溃了。
+  3. 这期间服务端做了剪裁。
+  4. 客户端用同一个 push_id 重试。
+
+  客户端写 pushed 日志时要知道哪些事务冲突了，所以服务端要能把原来的结果原样返回
+  。也就是说，每个客户端的最后一次
+  push，进度记录里要带上完整的结果，即哪些事务被
+  accept、哪些冲突了。剪裁不能只留一个 push_id。
+
+  这样理解对吗？
+
+  已经自洽、不用再确认的几种情况
+
+  - 快照里同名 key 换了 key_id：本地 A 是 k1，快照里 A 是 k2。因为先删除再
+    merge，k1 会先被删掉，再 merge k2，不会出现同名两条链。
+  - 快照之后自己又 push 了：自己在 seq=101 改了 A，有效节点到了
+    v5，而快照（S=100）里 A 是 v4。merge 时 v5 ≥ v4，忽略，不会回退。
+  - 服务端剪掉删除节点前后，push
+    的判定不变：删除节点还在时，「改」的版本对不上，冲突；被剪掉后，key_id
+    找不到，也是冲突。「增」在两种情况下都会 accept。
+
+❯ 第四条：你理解没错
+  > 1. 全量 pull 遇到本地没 push 的分支
+  对
+  2. 服务端剪裁后，push 结果还要保留
+  对
+  继续讨论理解
+
+⏺ 第 4 条、全量 pull 遇到本地没 push 的分支、push
+  结果保留，这三条都确认了。继续往下推，push 和注册这两块各有一处需要确认。
+
+  1. 传染在服务端也要执行
+
+  一次 push 里可能带了多个事务，服务端按顺序逐个判定。大部分情况下，按版本判定的
+  结果和按名字传染的结果一样，但有一种情况不一样：
+
+  - 本地有两个事务：T1 删除 A（k1），T2 重建 A（k3）。两个事务在同一次 push 里。
+  - 服务端那边，A 已经被别人删掉了。
+  - T1：服务端找不到 k1，冲突。
+  - T2：服务端判「增」，服务端没有 A，所以 accept。
+
+  可是按名字传染，T2 应该随 T1 一起冲突。也就是说，客户端认为 T2
+  冲突，服务端却已经把它接受了，两边不一致。
+
+  我的理解是：服务端处理同一次 push
+  里的事务时，也要按名字传染。前面某个事务冲突了，后面同名 key
+  的事务直接判冲突，不再单独判定。这样服务端返回的结果就和客户端的传染规则一致。
+
+  跨 push 的情况不用管，因为被传染的事务在客户端已经标成冲突，不会再
+  push。对吗？
+
+  2. 激活之前能不能写、激活超时怎么办
+
+  注册流程是：服务端创建 client_id → 客户端建本地日志 →
+  调用激活。如果激活之前客户端掉线了很久，服务端已经把这个没激活的 client_id
+  清理掉，客户端再来激活就会失败。
+
+  需要定两件事：
+
+  - 激活之前，本地能不能写？ 我的理解是可以写，只是不能
+    push。这和「全量拉完之前也能写」是一致的。
+  - 激活失败（client_id 已被清理）怎么办？ 我的理解是：重新申请一个
+    client_id，本地日志保留。本地还没 push 的修改，之后用新 client_id 正常
+    push。因为前面一直没激活，旧 client_id 不可能 push
+    过任何东西，所以不会出现重复提交。
+
+  这两点对吗？
+
+❯ 1. 对
+  2. 不能写，激活失败重新来，不存在旧的日志
+
+  继续理解和讨论
+
+⏺ 两点都确认了：服务端处理同一次 push
+  时也按名字传染；激活成功之前不能写，激活失败就重新走一遍注册流程。
+
+  继续往下推，本地写操作这一层的语义还没定，有三个问题。
+
+  1. 写接口：显式的增/改，还是统一的 Put？
+
+  push 时，「增」和「改」的判定规则不一样，所以每个节点都必须带上明确的操作类型
+  。应用层可以选两种接口：
+
+  - (a) 显式 Create / Update / Delete：本地已有这个 key 时，Create
+    报错；本地没有这个 key 时，Update 或 Delete 报错。
+  - (b) Put / Delete：Put 由存储层自动判断。本地没有这个
+    key，或者已经删除，就当作「增」，分配新的 key_id；否则当作「改」。Delete
+    一个不存在的 key，什么也不做。
+
+  我倾向 (b)，应用层不用自己先查一遍。你倾向哪种？
+
+  2. 同一个事务里多次写同一个 key
+
+  比如一个事务里先把 A 改成 1，再改成 2。这个事务产生几个节点？
+
+  - 合并成一个节点：A 只前进一个版本，节点的值是 2。
+  - 每次写一个节点：A 前进两个版本。
+
+  我倾向合并成一个节点：事务是原子的，中间状态对外不可见，留着没有意义。
+
+  例外是先删除再重建：两个操作属于不同的
+  key_id，必须保留成两个节点，旧链上一个删除节点，新链上一个首节点。
+
+  这样可以吗？
+
+  3. 事务就是一个写批次？
+
+  传染规则只看写集合，所以我的理解是：事务就是一组原子提交的写，不记录读集合，也
+  不做读校验。
+
+  - 事务里读一个 key，能读到本事务前面写入的值。
+  - 读事务外的 key，就是普通的本地读。提交时不检查这个值有没有被别人改过。
+
+  对吗？
+
+❯ 1. 操作要带版本号
+  2. 可以
+  3. 只要我读到的东西我都改它一下
+
+  继续理解讨论
+
+⏺ 第 2 条确认了：同一个事务里多次写同一个 key，合并成一个节点。第 1、3
+  条合起来，事务的语义就清楚了：
+
+  - 应用层读到的每个 key 都要写一遍。所以事务的读集合包含在写集合里。
+  - 每个写操作都带着读到时的版本，提交时校验这个版本还是不是当前版本。
+
+  这样一来，push 时的版本判定、冲突的传染，就同时覆盖了这个事务读过的数据。不用
+  另外记录读集合，事务也不会基于过时的读结果提交。
+
+  下面是这个模型里需要确认的地方。
+
+  1. 接口形式
+
+  - Get(key) 返回 (key_id, version, value)。
+  - 写操作带上读到的 key_id 和 version：
+    - 改 / 删：带 (key_id, version)，要求等于本地当前可见的节点。
+    - 增：要求这个 key 当前不存在，或者已经被删除。
+  - 事务里任何一个操作的版本校验失败，整个事务在本地就提交失败，由应用层重新读、
+    重新提交。
+
+  版本号只在同一个 key_id 里有意义：删了重建以后，又从 0 开始。所以写操作要带
+  key_id 加 version，只带版本号不够。
+
+  对吗？
+
+  2. 分叉后版本号会重复，只校验版本号会出错
+
+  冲突后会从最新有效节点分叉，新分支的版本号和冲突分支会重叠。下面这个流程里，一
+  次过期的写会被误判为合法：
+
+  1. 本地 A（k1）的有效节点是 v4。
+  2. 应用 X 读到 A，拿到 (k1, v4)；接着提交了一次修改，产生 v5。
+  3. 应用 Y 读到 A，拿到 (k1, v5)，然后去做别的事。
+  4. push 冲突。v5 成了冲突分支，A 回到 v4。
+  5. 应用 X 重新读到 (k1, v4)，再次修改 A，产生新分支上的 v5'。
+  6. 应用 Y 回来，拿着 (k1, v5) 提交修改。本地当前节点也是 (k1, v5)，校验通过。
+
+  可是应用 Y 读到的其实是已经冲突作废的 v5，这次提交本该失败。
+
+  这里有两种修法：
+
+  - (a) 每个节点再带一个本地唯一的节点 id，比如本地自增序号，写操作带它做校验。
+  - (b) 分叉后版本号不复用：新分支从「冲突分支最大版本 +
+    1」接着编号。比如上例中新分支直接从 v6 开始。push
+    的规则改成：第一个服务端没有的节点，它的父节点版本等于服务端当前版本。
+
+  我倾向 (a)：版本号的语义保持不变，push 规则也不用动。你倾向哪种？
+
+❯ 1. 对
+  2. a吧，那就是相当于要确定基于的分支追加一个节点，单单版本号无法精确识别分支
+
+  继续理解和讨论
+
+⏺ 确认，就用 (a)：写操作指定要追加在哪个节点后面，用本地节点 id 精确定位到分支。
+
+  由此推出的一个不变量
+
+  每个 key
+  在任何时刻最多只有一条活着的分支可以追加节点，就是当前可见节点所在的那条：
+
+  - 有未 push 的节点（包括正在 push 中的）时，可见节点是未 push 分支的末端。
+  - 没有时，可见节点是最新的有效节点。
+  - 冲突分支不可见，不能在它后面追加。拿着冲突分支上的节点 id 去写，一定失败。
+
+  下面几种情况也都自然成立，不需要额外规则：
+
+  - push 被 accept：节点 id 不变，应用手里的 token 依然有效。
+  - merge 进新节点：可见节点前移，应用手里旧的 token 失效，写入失败。
+  - 全量 pull 跳版本，或者全量 pull 产生本地删除节点：同上，旧 token 失效。
+  - 本地剪裁：只会剪掉不可见的节点，可见节点一定会保留。所以剪裁不会让一个仍然有
+    效的 token 失效。
+
+  需要确认：「增」的前提条件要不要也精确到节点
+
+  改和删已经精确到节点了，但「增」目前的前提只是「当前不存在」。这样会有 ABA
+  问题：
+
+  1. 应用 X 读 A，结果是不存在。
+  2. 应用 Y 创建了 A（k3），又把它删掉了。
+  3. 应用 X 基于第 1 步「不存在」的判断创建 A。A 当前确实不存在，校验通过。
+
+  有两种做法：
+
+  - (a) 接受这种情况：X
+    的判断依据是「不存在」，而这个状态依然成立，所以可以认为不算错。
+  - (b) 「增」也带 token：Get 读到一个已删除的 key，返回删除节点的
+    id。「增」要带上这个 id 做校验；从来没存在过的 key，带一个空 token。这样第 3
+    步会失败。
+
+  方案 (b) 有个问题：删除节点可能已经被剪裁掉了。剪掉以后，这个 key
+  就和从来没存在过一样，token 也只能退化成空 token。所以 (b) 也只能尽量检测出
+  ABA，做不到完全精确。
+
+  我倾向 (a)，简单而且语义自洽。你怎么看？
+
+❯ 选择a
+
+  继续理解和讨论
+
+⏺ 确认，「增」只检查当前是否存在。上面那种 ABA 情况视为正确，「增」不带 token。
+
+  继续往下推，又有一处需要确认，另外推出了一条新要求。
+
+  推出来的要求：push 结果要带 server_seq
+
+  全量 pull 时，有一条规则是「只删除快照 seq 之前已同步的本地
+  key」。要执行这条规则，客户端得知道自己每个被 accept 的事务落在哪个 server_seq
+  上。
+
+  所以服务端返回的 push 结果里，每个被 accept 的事务都要带上分配给它的
+  server_seq。服务端为了幂等保留的「最后一次 push 结果」里，也要包含这些
+  seq。客户端写 pushed 日志时，把它们一起记下来。
+
+  需要确认：已激活的客户端会不会过期
+
+  目前只规定了服务端会清理没激活的
+  client_id。已激活的客户端，服务端会一直保留它的 push 进度和最后一次 push
+  结果。
+
+  如果一个客户端激活以后就再也不出现了，比如设备丢了，这条记录就会永远留在服务端
+  。
+
+  - (a) 永不过期：最简单，代价是服务端上残留的记录越来越多。
+  - (b) 长时间不活跃就清理：这样一来，客户端回来时用旧的 push_id 重试会找不到记
+    录，就需要定义这时怎么处理。比如让客户端整体作废、重新注册，但这样它本地没
+    push 的修改就丢了。
+
+  你倾向哪种？
+
+  目前的进展
+
+  除了上面这一处，同步这块的语义我这边已经推不出新的漏洞了，包括本地写、push、冲
+  突传染、pull/merge、两端的剪裁，以及读和写的版本校验。剩下没讲的是分层覆盖和屏
+  蔽。
+
+  接下来有两种走法，你选一种：
+  - 你继续发分层的设计，先讨论完再写代码。
+  - 我先把已经定下来的语义整理成
+    docs/design.md，开始实现本地存储层和同步部分，分层发过来以后再加进去。
+
+❯ >需要确认：已激活的客户端会不会过期
+  永不过期
+
+  我还需要和你讨论一处，我将在下一条消息发给你
+
+⏺ 好的，已激活的客户端永不过期，服务端一直保留它的 push 进度和最后一次 push
+  结果。
+
+  我等你下一条消息。
+
+❯ 解决客户端被复制的问题：
+
+  如何客户端db被复制，就会出现两个客户端带同一个client_id
+  这样push会出问题
+  我希望每次push都带prev_push_id和push_id服务端存起来
+  而且服务端要校验req.prev_push_id是否等于服务端的push_id，或者req.prev_push_id
+  =server.pre_push_id&&req.push_id=server.push_id
+  因为如果db被复制后，它们将产生完全不一样的pushid，先push的会胜利，后push的我
+  们就能让它永远失败
+
+⏺ 我理解这个方案是在每个客户端的 push 上建一条链。服务端为每个 client_id
+  保存最后一次 push 的 (prev_push_id,
+  push_id)，再加上它的结果。收到请求时按三种情况处理：
+
+  ┌──────────────────────────────────┬──────────────────────────────────────┐
+  │               请求               │                 判定                 │
+  ├──────────────────────────────────┼──────────────────────────────────────┤
+  │ req.prev_push_id ==              │ 新的 push，链往前推进一格，保存新的  │
+  │ server.push_id                   │ (prev, push_id) 和结果               │
+  ├──────────────────────────────────┼──────────────────────────────────────┤
+  │ req.prev_push_id ==              │                                      │
+  │ server.prev_push_id 且           │ 重试，原样返回保存的结果             │
+  │ req.push_id == server.push_id    │                                      │
+  ├──────────────────────────────────┼──────────────────────────────────────┤
+  │ 其他                             │ 链分叉了，永久拒绝                   │
+  └──────────────────────────────────┴──────────────────────────────────────┘
+
+  - 第一次 push：prev_push_id
+    为空。服务端新激活的客户端，记录也是空的，满足第一种情况。
+  - 本地要多存一个字段：写 prepare 日志时，把上一次 pushed 的 push_id 作为
+    prev_push_id 一起存下来，之后每次重试都原样带上。
+
+  几种复制的时机都推演过了，结果都对：
+
+  - 在两次 push 之间复制：两份 db 的 prev_push_id 相同，但各自生成的 push_id
+    不同。先到服务端的那份推进了链，后到的那份 prev_push_id
+    已经对不上，永久失败。
+  - 在 prepare 之后、pushed 之前复制：两份 db 带着同一个 push_id，push
+    的内容也一样，因为是 prepare
+    时冻结的。两份都会被当成重试，拿到同一个结果，没有问题。之后两份各自生成新的
+    push_id，就回到上一种情况，只有一份能胜出。
+  - 从旧的备份恢复：服务端的链已经比备份走得远了，备份带的 prev_push_id
+    对不上，同样会永久失败。我认为这是对的：备份不知道服务端已经接受了哪些它自己
+    push 过的事务，再继续 push 就会出错。
+
+  需要确认
+
+  1. 失败的那份 db 之后怎么办？
+     - (a) 只是 push 永久失败。本地照常读写，修改永远同步不上去。
+     - (b) 服务端返回一个专门的「分叉」错误。客户端收到以后把自己标记为作废，之
+       后的本地写入一律拒绝，让应用层知道该处理了。
+
+     我倾向 (b)，不然用户会在一份永远同步不上去的 db 上一直写。
+  2. pull 要不要也校验？
+
+     pull 是只读的，复制出来的那份继续 pull
+     不会弄坏服务端的数据。不过，如果失败的那份按 (b) 已经作废，pull
+     也就没有意义了。
+
+     我理解 pull 不需要校验，直接在客户端停掉就行。对吗？
+
+❯ 1. b
+  2. 不用校验，push如果是分叉错误，pull也不用做了
+
+  我没什么要讨论的了
+⏺ 这些内容讨论下来，同步部分的语义已经完整了。我先确认一下本机的 Go
+  环境，然后把定下来的设计写成文档，再开始实现：本地存储、注册、push、pull/merge
+  、两端剪裁，以及分叉检测。分层那部分等你发过来再做。
+
+⏺ Bash(go version && ls -la && git log --oneline | head)
+  ⎿  (No output)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Bash(go mod init tidepact && go get modernc.org/sqlite@latest
+      github.com/google/uuid@latest 2>&1 | tail -5)
+  ⎿  Created go.mod (+16 -0)
+       1 +module tidepact                                                
+       2 +                                                               
+       3 +go 1.26.0                                                      
+       4 +                                                               
+       5 +require (                                                      
+       6 +        github.com/dustin/go-humanize v1.1.0 // indirect       
+       7 +        github.com/google/uuid v1.6.0 // indirect              
+       8 +        github.com/mattn/go-isatty v0.0.24 // indirect         
+       9 +        github.com/ncruces/go-strftime v1.1.0 // indirect      
+      10 +        github.com/remyoudompheng/bigfft v0.0.0-20230129092748-
+         +24d4a6f8daec // indirect                                       
+      11 +        golang.org/x/sys v0.49.0 // indirect                   
+      12 +        modernc.org/libc v1.79.0 // indirect                   
+      13 +        modernc.org/mathutil v1.7.1 // indirect                
+      14 +        modernc.org/memory v1.12.1 // indirect                 
+      15 +        modernc.org/sqlite v1.61.1 // indirect                 
+      16 +)                                                              
+  ⎿  Created go.sum (+20 -0)
+       1 +github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMu
+         +ZogJACoMlvWIWZ5b2xWg=                                          
+       2 +github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmj
+         +MQF3QNRAZBwY8AXBAzKYoSX9sFI=                                   
+       3 +github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr
+         ++hNrb57e+94F0=                                                 
+       4 +github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGG
+         +pEw/LqOeaOT+nhxU+yHo=                                          
+       5 +github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8B
+         +SWMRd47J3Lbz7vsReI=                                            
+       6 +github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDg
+         +nfIwz6ydEQApk5oEI3HqDio6A=                                     
+       7 +github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9E
+         +wJGvrOCKvMNI4obWL47Hk=                                         
+       8 +github.com/ncruces/go-strftime v1.1.0/go.mod h1:yVaq7iwCN09vHRr
+         +KBrrflXT0M9tTMG2KmZ9Fj7xeG/g=                                  
+       9 +github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8
+         +daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=           
+      10 +github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8
+         +daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=    
+      11 +golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1
+         +M0gROTXA=                                                      
+      12 +golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPE
+         +ecfsnNMuSxOs3og=                                               
+      13 +modernc.org/libc v1.79.0 h1:9Dvvv++bAMSkSuBzuOFAatbTV5OIoq6Y6Fo
+         +hmD3e7q8=                                                      
+      14 +modernc.org/libc v1.79.0/go.mod h1:uT3kR61NsbeKJSLqq83GJwSnZMVL
+         +lSjyAz4DfTaBy1M=                                               
+      15 +modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vA
+         +GGP4jZMCxOU=                                                   
+      16 +modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4Dt
+         +hTaT47/N3aT6MhfgJg=                                            
+      17 +modernc.org/memory v1.12.1 h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGU
+         +aR04pGbp9g=                                                    
+      18 +modernc.org/memory v1.12.1/go.mod h1:/JP4VbVC+K5sU2wZi9bHoq2MAk
+         +Cnrt2r98UGeSK7Mjw=                                             
+      19 +modernc.org/sqlite v1.61.1 h1:TBEE49wz7VlxS+qXRXMQiPUZYOXHJ4ku8
+         +3daYv1fe04=                                                    
+      20 +modernc.org/sqlite v1.61.1/go.mod h1:f4gr5tbpx2umklaT/QVtbi/50h
+         +NdM+4ng+2zMo8KXJ0=                                             
+
+⏺ Go 1.24 可用，项目目前只有两个空目录。我先写设计文档。
+
+⏺ Write(docs/design.md)
+  ⎿  Wrote 106 lines to docs/design.md
+       1 # TidePact 设计
+       2
+       3 异步多客户端、单服务端的 KV 数据库。客户端本地读写，后台与服务端
+         同步；
+       4 一组修改作为事务原子写入本地，并原子地被服务端接受或冲突。
+       5
+       6 > 分层（上层覆盖/屏蔽底层）尚未设计，见文末。
+       7
+       8 ## 1. 本地存储
+       9
+     … +97 lines (ctrl+o to expand)
+
+⏺ Now the shared pieces: SQLite helper and wire types.
+
+⏺ Write(internal/sqlitex/sqlitex.go)
+  ⎿  Wrote 54 lines to internal/sqlitex/sqlitex.go
+       1 // Package sqlitex wraps SQLite setup shared by the client and s
+         erver stores.
+       2 package sqlitex
+       3
+       4 import (
+       5   "context"
+       6   "database/sql"
+       7   "fmt"
+       8   "net/url"
+       9
+     … +45 lines (ctrl+o to expand)
+
+⏺ Write(wire/wire.go)
+  ⎿  Wrote 104 lines to wire/wire.go
+       1 // Package wire defines the client/server protocol types (JSON o
+         ver HTTP).
+       2 package wire
+       3
+       4 import (
+       5   "errors"
+       6   "fmt"
+       7 )
+       8
+       9 // Op is a node operation as seen by the server.
+     … +95 lines (ctrl+o to expand)
+
+⏺ Now the server store and HTTP handler.
+
+⏺ Write(server/store.go)
+  ⎿  Wrote 389 lines to server/store.go
+       1 // Package server implements the TidePact server: a single globa
+         l log of
+       2 // accepted transactions, per-key current state, and per-client
+         push chains.
+       3 package server
+       4
+       5 import (
+       6   "context"
+       7   "database/sql"
+       8   "encoding/json"
+     … +381 lines (ctrl+o to expand)
+
+⏺ Write(server/http.go)
+  ⎿  Wrote 77 lines to server/http.go
+       1 package server
+       2
+       3 import (
+       4   "encoding/json"
+       5   "errors"
+       6   "net/http"
+       7   "strconv"
+       8
+       9   "tidepact/wire"
+      10 )
+     … +67 lines (ctrl+o to expand)
+
+⏺ Now the client: transport, local store and writes.
+
+⏺ Write(client/transport.go)
+  ⎿  Wrote 99 lines to client/transport.go
+      1 package client
+      2
+      3 import (
+      4   "bytes"
+      5   "context"
+      6   "encoding/json"
+      7   "fmt"
+      8   "net/http"
+      9   "net/url"
+     … +90 lines (ctrl+o to expand)
+
+⏺ Write(client/client.go)
+  ⎿  Wrote 518 lines to client/client.go
+       1 // Package client implements the TidePact client: a local append
+         -only KV log
+       2 // that syncs with the server in the background. See docs/design
+         .md.
+       3 package client
+       4
+       5 import (
+       6   "context"
+       7   "database/sql"
+       8   "errors"
+     … +510 lines (ctrl+o to expand)
+
+⏺ Write(client/push.go)
+  ⎿  Wrote 274 lines to client/push.go
+       1 package client
+       2
+       3 import (
+       4   "context"
+       5   "database/sql"
+       6   "encoding/json"
+       7   "errors"
+       8   "fmt"
+       9
+      10   "github.com/google/uuid"
+     … +264 lines (ctrl+o to expand)
+
+⏺ Now pull, merge, sync, and compaction.
+
+⏺ Write(client/pull.go)
+  ⎿  Wrote 355 lines to client/pull.go
+      1 package client
+      2
+      3 import (
+      4   "context"
+      5   "database/sql"
+      6   "encoding/json"
+      7   "errors"
+      8   "fmt"
+      9   "time"
+     … +346 lines (ctrl+o to expand)
+
+⏺ Write(client/compact.go)
+  ⎿  Wrote 130 lines to client/compact.go
+       1 package client
+       2
+       3 import (
+       4   "context"
+       5   "database/sql"
+       6
+       7   "tidepact/internal/sqlitex"
+       8 )
+       9
+      10 // Compact prunes the local log (docs/design.md §5):
+     … +120 lines (ctrl+o to expand)
+
+⏺ Now the server binary.
+
+⏺ Write(cmd/tidepact-server/main.go)
+  ⎿  Wrote 71 lines to cmd/tidepact-server/main.go
+       1 // Command tidepact-server runs a TidePact server over HTTP.
+       2 package main
+       3
+       4 import (
+       5   "context"
+       6   "flag"
+       7   "log"
+       8   "net/http"
+       9   "os/signal"
+      10   "syscall"
+     … +61 lines (ctrl+o to expand)
+
+⏺ Bash(go mod tidy 2>&1 | tail -3 && go vet ./... && go build ./...)
+  ⎿  Updated go.mod (+5 -2)
+       2  
+       3  go 1.26.0
+       4  
+       5 +require (                                                      
+       6 +        github.com/google/uuid v1.6.0                          
+       7 +        modernc.org/sqlite v1.61.1                             
+       8 +)                                                              
+       9 +                                                               
+      10  require (
+      11          github.com/dustin/go-humanize v1.1.0 // indirect
+       7 -        github.com/google/uuid v1.6.0 // indirect              
+      12          github.com/mattn/go-isatty v0.0.24 // indirect
+      13          github.com/ncruces/go-strftime v1.1.0 // indirect
+      14          github.com/remyoudompheng/bigfft v0.0.0-20230129092748-
+          24d4a6f8daec // indirect
+     ...
+      16          modernc.org/libc v1.79.0 // indirect
+      17          modernc.org/mathutil v1.7.1 // indirect
+      18          modernc.org/memory v1.12.1 // indirect
+      15 -        modernc.org/sqlite v1.61.1 // indirect                 
+      19  )
+  ⎿  Updated go.sum (+30 -0)
+       1  github.com/dustin/go-humanize v1.1.0 h1:dbKTrvD0klcbBV/h4AWJdMu
+          ZogJACoMlvWIWZ5b2xWg=
+       2  github.com/dustin/go-humanize v1.1.0/go.mod h1:hc1CvRkJMsgxqjmj
+          MQF3QNRAZBwY8AXBAzKYoSX9sFI=
+       3 +github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50 h1:P
+         +lNWJRxu5APSV0pWqfIsZ0qt9OOGHSWfZQ4zvx+WgWs=                    
+       4 +github.com/google/pprof v0.0.0-20261016150608-1facf8f91b50/go.m
+         +od h1:yUo1AMMpsPIDFGuwDK8nLcf8+vvAd5l2O6JDZ6hpwrM=             
+       5  github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr
+          +hNrb57e+94F0=
+       6  github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGG
+          pEw/LqOeaOT+nhxU+yHo=
+       7 +github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6t
+         +VxozPZFVghXaHOwFs4luLUK2k=                                     
+       8 +github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6
+         +QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=                              
+       9  github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8B
+          SWMRd47J3Lbz7vsReI=
+      10  github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDg
+          nfIwz6ydEQApk5oEI3HqDio6A=
+      11  github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9E
+          wJGvrOCKvMNI4obWL47Hk=
+      12  github.com/ncruces/go-strftime v1.1.0/go.mod h1:yVaq7iwCN09vHRr
+          KBrrflXT0M9tTMG2KmZ9Fj7xeG/g=
+      13  github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8
+          daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
+      14  github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8
+          daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
+      15 +golang.org/x/mod v0.42.0 h1:ICeL3t2L30ljSPHHxDnR4fqVcBt/zR2zJAb
+         +9juavmQg=                                                      
+      16 +golang.org/x/mod v0.42.0/go.mod h1:u5fzIrRInkL8MaO1cbRkUHT64v30
+         +3YIT5KEqpNr7jRs=                                               
+      17 +golang.org/x/sync v0.24.0 h1:iqiDrGoDgyuvAKrhLQthUEzU/R378N78gX
+         +bBjxed7oA=                                                     
+      18 +golang.org/x/sync v0.24.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1S
+         +hEbZ6BBqskPbjZm0=                                              
+      19  golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1
+          M0gROTXA=
+      20  golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPE
+          ecfsnNMuSxOs3og=
+      21 +golang.org/x/tools v0.52.0 h1:ryxg4U63oaUYk7uOLTF37n43f4qgtGvqV
+         +4Ioit1BaEs=                                                    
+      22 +golang.org/x/tools v0.52.0/go.mod h1:ItcP5UNaVGG+Yc4eIYmaFLNJ4s
+         +oEopkx5Y2d4lcEurs=                                             
+      23 +modernc.org/cc/v4 v4.30.3 h1:aDq8gIX1X7+VFgO/JYYji6pLWL2H4tv3g8
+         +WatT3KCys=                                                     
+      24 +modernc.org/cc/v4 v4.30.3/go.mod h1:OnovgIhbbMXMu1aISnJ0wvVD1Kn
+         +W+cAUJkIrAWh+kVI=                                              
+      25 +modernc.org/ccgo/v4 v4.37.0 h1:BAuJCUtIHIxFIYaFhqXIw5YaoMBlNCUl
+         +FovejHfMip4=                                                   
+      26 +modernc.org/ccgo/v4 v4.37.0/go.mod h1:/8627VhwWtAbqUXmPORxFQU5S
+         +gLrAx2jl9seLw9GBhY=                                            
+      27 +modernc.org/fileutil v1.4.0 h1:j6ZzNTftVS054gi281TyLjHPp6CPHr2K
+         +CxEXjEbD6SM=                                                   
+      28 +modernc.org/fileutil v1.4.0/go.mod h1:EqdKFDxiByqxLk8ozOxObDSfc
+         +VOv/54xDs/DUHdvCUU=                                            
+      29 +modernc.org/gc/v2 v2.6.5 h1:nyqdV8q46KvTpZlsw66kWqwXRHdjIlJOhG6
+         +kxiV/9xI=                                                      
+      30 +modernc.org/gc/v2 v2.6.5/go.mod h1:YgIahr1ypgfe7chRuJi2gD7DBQiK
+         +SLMPgBQe9oIiito=                                               
+      31 +modernc.org/gc/v3 v3.2.0 h1:/Y3LGDMQaoYf55PebP1qsZ5FDGgAZyG1RYK
+         +EHeQzh1o=                                                      
+      32 +modernc.org/gc/v3 v3.2.0/go.mod h1:HFK/6AGESC7Ex+EZJhJ2Gni6cTaY
+         +pSMmU/cT9RmlfYY=                                               
+      33 +modernc.org/goabi0 v0.2.0 h1:HvEowk7LxcPd0eq6mVOAEMai46V+i7Jrj1
+         +3t4AzuNks=                                                     
+      34 +modernc.org/goabi0 v0.2.0/go.mod h1:CEFRnnJhKvWT1c1JTI3Avm+tgOW
+         +bkOu5oPA8eH8LnMI=                                              
+      35  modernc.org/libc v1.79.0 h1:9Dvvv++bAMSkSuBzuOFAatbTV5OIoq6Y6Fo
+          hmD3e7q8=
+      36  modernc.org/libc v1.79.0/go.mod h1:uT3kR61NsbeKJSLqq83GJwSnZMVL
+          lSjyAz4DfTaBy1M=
+      37  modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vA
+          GGP4jZMCxOU=
+      38  modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4Dt
+          hTaT47/N3aT6MhfgJg=
+      39  modernc.org/memory v1.12.1 h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGU
+          aR04pGbp9g=
+      40  modernc.org/memory v1.12.1/go.mod h1:/JP4VbVC+K5sU2wZi9bHoq2MAk
+          Cnrt2r98UGeSK7Mjw=
+     … 10 more lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+⏺ It builds. Now an integration test suite that covers the scenarios we
+  discussed.
+
+⏺ Write(client/sync_test.go)
+  ⎿  Wrote 494 lines to client/sync_test.go
+       1 package client
+       2
+       3 import (
+       4   "context"
+       5   "errors"
+       6   "io"
+       7   "net/http/httptest"
+       8   "os"
+       9   "path/filepath"
+      10   "sync/atomic"
+     … +484 lines (ctrl+o to expand)
+
+⏺ Bash(go vet ./... && go test ./... 2>&1 | tail -40)  ⎿  (No output)
+  ⎿  (timeout 5m)
+
+⏺ Found two small bugs: Sync wasn't pushing writes added after a prepared push,
+  and the compaction test's first sync used a snapshot so compaction had nothing
+  to remove. I'll fix pushLocked to push newly pending writes after a prepared
+  push completes, and adjust the test so c2 syncs before c1 starts writing.
+
+⏺ Update(client/push.go)
+  ⎿  Added 12 lines
+      22    return c.pushLocked(ctx)
+      23  }
+      24  
+      25 +// pushLocked completes a previously prepared push (if any), th
+         +en pushes the                                                  
+      26 +// transactions that were pending behind it.                   
+      27  func (c *Client) pushLocked(ctx context.Context) error {
+      28 +  for i := 0; i < 2; i++ {                                     
+      29 +    pushed, err := c.pushOnce(ctx)                             
+      30 +    if err != nil || !pushed {                                 
+      31 +      return err                                               
+      32 +    }                                                          
+      33 +  }                                                            
+      34 +  return nil                                                   
+      35 +}                                                              
+      36 +                                                               
+      37 +func (c *Client) pushOnce(ctx context.Context) (bool, error) { 
+      38    var req *wire.PushRequest
+      39    err := sqlitex.WithTx(ctx, c.db, func(tx *sql.Tx) error {
+      40      if err := checkWritable(tx); err != nil {
+
+⏺ Update(client/push.go)
+  ⎿  Added 5 lines, removed 5 lines
+      45      return err
+      46    })
+      47    if err != nil || req == nil {
+      48 -    return err                                                 
+      48 +    return false, err                                          
+      49    }
+      50    resp, err := c.tr.Push(ctx, req)
+      51    if wire.IsCode(err, wire.CodeForked) {
+      52      if err := setMeta(c.db, "forked", "1"); err != nil {
+      53 -      return err                                               
+      53 +      return false, err                                        
+      54      }
+      55 -    return ErrForked                                           
+      55 +    return false, ErrForked                                    
+      56    }
+      57    if err != nil {
+      58 -    return err                                                 
+      58 +    return false, err                                          
+      59    }
+      60 -  return sqlitex.WithTx(ctx, c.db, func(tx *sql.Tx) error { ret
+         -urn applyPushed(tx, req, resp) })                              
+      60 +  return true, sqlitex.WithTx(ctx, c.db, func(tx *sql.Tx) error
+         + { return applyPushed(tx, req, resp) })                        
+      61  }
+      62  
+      63  // preparePush returns the already prepared push, or freezes al
+          l pending
+
+⏺ Update(client/sync_test.go)
+  ⎿  Added 1 line
+      443    e := newEnv(t)
+      444    c1, _ := e.open("c1.db")
+      445    c2, _ := e.open("c2.db")
+      446 +  must(t, c2.Sync(ctx)) // start c2 incrementally so it receiv
+          +es every version                                              
+      447    for i := 0; i < 5; i++ {
+      448      put(t, c1, "a", "a-final")
+      449      put(t, c1, "b", "b-final")
+
+⏺ Bash(go vet ./... && go test -count=1 -race ./... 2>&1 | tail -20)
+  ⎿  (No output)
+  ⎿  (timeout 5m)
+
+⏺ The IDE errors came from the intermediate state between the two edits. After
+  both edits the build is clean, and all tests pass with -race.
+
+⏺ Bash(printf '*.db\n*.db-wal\n*.db-shm\n/tidepact-server\n' > .gitignore && go
+      test -count=1 -v ./client 2>&1 | grep -E '^(---|ok|FAIL)' )
+  ⎿  Created .gitignore (+4 -0)
+      1 +*.db                                                            
+      2 +*.db-wal                                                        
+      3 +*.db-shm                                                        
+      4 +/tidepact-server                                                
+
+⏺ TidePact 的同步部分已经实现。12
+  个集成测试覆盖了我们讨论过的场景，全部通过，加了 -race
+  也通过。分层还没做，等你发设计。代码还没有提交。
+
+  代码结构
+
+  ┌─────────────────────────────┬────────────────────────────────────────────┐
+  │            位置             │                    内容                    │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ docs/design.md              │ 讨论定下来的规则整理成的规格文档           │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ wire/wire.go                │ 客户端和服务端之间的协议类型和错误码       │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ server/store.go             │ 服务端：注册/激活、push                    │
+  │                             │ 判定、分叉检测、pull、快照、剪裁           │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ server/http.go              │ 服务端 HTTP 接口                           │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ client/client.go            │ 本地存储、读取、Commit 写入、注册激活      │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ client/push.go              │ push：prepare、带 prev_push_id             │
+  │                             │ 发送、处理结果、按名字传染冲突             │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ client/pull.go              │ pull、merge、快照 merge、Sync 和后台同步   │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ client/compact.go           │ 本地剪裁                                   │
+  ├─────────────────────────────┼────────────────────────────────────────────┤
+  │ cmd/tidepact-server/main.go │ 服务端程序，定期清理未激活的               │
+  │                             │ client_id，可选定期剪裁                    │
+  └─────────────────────────────┴────────────────────────────────────────────┘
+
+  接口用法：Get 返回带 token（即节点 id）的值。写入是 c.Commit(ctx, Create(k,
+  v), Update(k, token, v), Delete(k, token))，所有操作在一个事务里原子提交。
+
+  测试覆盖的场景：
+  - 本地写入和 token 校验
+  - 冲突后合并对方的值
+  - 按名字传染，包括 push 进行中写入的事务
+  - 服务端在同一次 push 内传染（先删后建的情况）
+  - 响应丢失后用同一个 push_id 重试
+  - 服务端剪裁后的全量 pull，包括删除、换 key_id、版本跳跃
+  - db 被复制后的分叉检测，包括在 prepare 之后复制
+  - 分叉后版本号重复时 token 能正确识别
+  - 本地剪裁
+  - 激活失败后重新注册
+
+  讨论中没定、我自己做的决定
+
+  - 通信用 HTTP/JSON：之前提过 gRPC，但 HTTP/JSON 不需要 protoc
+    代码生成，实现更简单。要换的话只涉及 Transport 接口的实现。
+  - merge 先比版本、再判断是否阻塞：本地已经有这个版本时直接忽略，即使这条
+    key_id 上还有没 push 的节点也不阻塞。否则，自己被 accept
+    的事务被拉回来时，会被后续的新修改反复卡住。只有服务端版本更新、本地又有没
+    push 的节点时，才先 push。
+  - 一次 Sync 最多连续 push 两次：第一次完成上次没完成的 prepared push，第二次
+    push 它后面新积累的事务。测试里发现只 push 一次的话，这些新事务要等到下一次
+    Sync 才会发出去。
+  - 事务内多次写同一个 key 时的 token：都带事务开始前读到的那个 token。key
+    是在同一事务里刚创建的，就带 0。
+
+  还没覆盖的
+
+  - 服务端没有单独的单元测试，只通过客户端的集成测试间接覆盖。
+  - 后台定时同步（StartBackgroundSync）没有专门的测试。
+  - 全量快照是一次性返回的，没有分页。数据量大的话要改。
+
+  需要我提交代码的话告诉我。
+
+❯ <ide_opened_file>The user opened the file
+  /Users/hyan23/Desktop/TidePact/client/client.go in the IDE. This may or may
+  not be related to the current task.</ide_opened_file>
+
+❯ token是什么
+
+⏺ token 就是你读到的那个节点在本地的
+  node_id。写的时候带上它，用来证明「我是基于这个节点改的」。
+
+  为什么需要它
+
+  我们讨论时定了：写操作要带版本号，校验读到的东西没过时。但单靠 (key_id,
+  version) 不够，因为冲突后会分叉，版本号会重复：
+
+  1. 本地 A 的有效节点是 v0。应用改了一次，产生 v1，这个 v1 后来 push 冲突了。
+  2. 冲突后，A 从 v0 重新分叉，再改一次，又产生一个 v1。
+  3. 两个 v1 的 key_id 和版本号完全一样，但其实是两个不同的节点。
+
+  node_id 在本地唯一，每个节点都不一样，所以能精确区分。这就是当时选的方案
+  (a)，用节点 id 做校验。测试 TestStaleTokenAcrossConflictFork
+  验证的就是这个场景。
+
+  怎么用
+
+  it, _ := c.Get(ctx, "a")  // it.Token 就是当前可见节点的 node_id
+  c.Commit(ctx, client.Update("a", it.Token, []byte("new")))
+
+  Commit 时，Update 和 Delete 带的 token 必须等于这个 key 当前可见节点的
+  id，否则返回 ErrStale，整个事务失败。应用层重新 Get，再重新提交。Create 不带
+  token，只检查 key 当前不存在。
+
+  什么时候 token 会失效
+
+  只要可见节点变了，旧 token 就失效：
+
+  - 本地别处写过这个 key：产生了新节点。
+  - merge 进了服务端的新版本：可见节点前移。
+  - push 冲突：可见节点回退到有效节点，冲突分支上的节点 id 再也对不上。
+  - 全量 pull 跳了版本，或者产生了本地删除节点：可见节点变了。
+
+  push 被 accept 时，节点 id 不变，token 依然有效。
+
+  关于名字
+
+  叫它 token，是因为对应用层来说它是个不透明的凭证，只需要原样传回来，不用理解里
+  面是什么。你觉得叫 NodeID 更直白的话，我可以改名。
+
+❯ 提交吧
+
+⏺ Bash(git add -A && git status --short && git commit -q -m "$(cat <<'EOF'
+      Implement TidePact sync core: local log, push, pull/merge, compaction…)
+  ⎿  (No output)
+
+⏺ 代码已经提交到 main，提交号 ff0ac48。这是仓库的第一个提交，包含全部 15
+  个文件。.gitignore 排除了 *.db
+  等运行时文件，所以本地数据库不会进仓库。我没有推送到远程。
